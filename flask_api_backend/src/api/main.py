@@ -94,6 +94,12 @@ class TaskUpdate(BaseModel):
 
 
 # PUBLIC_INTERFACE
+class TaskCompletionUpdate(BaseModel):
+    """Model for updating the completion status of a task."""
+    completed: bool = Field(..., description="New completion status (true/false)")
+
+
+# PUBLIC_INTERFACE
 class TaskOut(TaskBase):
     id: int = Field(..., description="Task ID")
     overdue: bool = Field(
@@ -314,6 +320,60 @@ def update_task(
         due_date=task.due_date,
         completed=task.completed,
         overdue=overdue
+    )
+
+
+# PUBLIC_INTERFACE
+@app.patch(
+    "/api/tasks/{task_id}/completed",
+    response_model=TaskOut,
+    tags=["Tasks"],
+    summary="Update a task's completed status",
+    responses={
+        200: {"description": "Task completion status updated"},
+        404: {"description": "Task not found"},
+        422: {"description": "Invalid input"},
+    },
+)
+def update_task_completion(
+    task_id: int = Path(..., description="Task ID"),
+    status_in: TaskCompletionUpdate = ...,
+    db: Session = Depends(get_db),
+):
+    """
+    Update the 'completed' status of a task by its ID. Only the completed
+    field will be modified.
+
+    - **task_id**: The ID of the task to update.
+    - **completed**: Boolean (true/false) representing new state.
+
+    Returns the updated task or 404 if not found.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} not found"
+        )
+    task.completed = status_in.completed
+    db.commit()
+    db.refresh(task)
+    # Compute overdue flag for response
+    overdue = False
+    if task.due_date:
+        task_due = task.due_date
+        if task_due.tzinfo is None:
+            task_due = task_due.replace(tzinfo=timezone.utc)
+        overdue = (task_due.date() < date.today()) and (not task.completed)
+    return TaskOut(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        category=task.category,
+        priority=task.priority,
+        due_date=task.due_date,
+        completed=task.completed,
+        overdue=overdue,
     )
 
 
