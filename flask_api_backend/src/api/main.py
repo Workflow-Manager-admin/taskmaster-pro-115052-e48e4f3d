@@ -1,13 +1,12 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Query, Path
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Dict, Union
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone, date
 from pydantic import BaseModel, Field
 from .database import engine, Base, SessionLocal
 from .models import Task
-
 
 app = FastAPI(
     title="TaskMaster Pro API",
@@ -26,7 +25,6 @@ app = FastAPI(
     ]
 )
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,8 +34,8 @@ app.add_middleware(
 )
 
 
-# Dependency to get DB session
 def get_db():
+    """Dependency to get DB session."""
     db = SessionLocal()
     try:
         yield db
@@ -98,9 +96,30 @@ class TaskUpdate(BaseModel):
 # PUBLIC_INTERFACE
 class TaskOut(TaskBase):
     id: int = Field(..., description="Task ID")
+    overdue: bool = Field(
+        ..., description="Is the task overdue (due_date < today and not completed)"
+    )
 
     class Config:
         from_attributes = True
+        json_schema_extra = {
+            "example": {
+                "id": 1,
+                "title": "Finish code",
+                "description": "Implement endpoint",
+                "category": "Coding",
+                "priority": 1,
+                "due_date": "2024-07-11T12:00:00",
+                "completed": False,
+                "overdue": True
+            }
+        }
+
+
+# Used for group-by response
+class CategoryGroup(BaseModel):
+    category: str = Field(..., description="Task Category")
+    tasks: List[TaskOut] = Field(..., description="List of tasks in this category")
 
 
 @app.on_event("startup")
@@ -119,13 +138,12 @@ def health_check():
 
 # ---- CRUD Endpoints ----
 
-
 # PUBLIC_INTERFACE
 @app.get(
     "/api/tasks",
-    response_model=List[TaskOut],
+    response_model=Union[List[TaskOut], List[CategoryGroup]],
     tags=["Tasks"],
-    summary="List/filter all tasks"
+    summary="List/filter all tasks",
 )
 def list_tasks(
     category: Optional[str] = Query(
@@ -137,10 +155,15 @@ def list_tasks(
     q: Optional[str] = Query(
         None, description="Search substring in title or description"
     ),
+    group_by: Optional[str] = Query(
+        None, description="Group tasks by field, e.g. 'category'"
+    ),
     db: Session = Depends(get_db)
 ):
     """
     Retrieve all tasks, with optional filtering by category, completion, or search term.
+    Use `group_by=category` to group results by category.
+    Each task includes an 'overdue' field if the due date is before today and not completed.
     """
     tasks_query = db.query(Task)
     if category is not None:
@@ -152,11 +175,56 @@ def list_tasks(
         tasks_query = tasks_query.filter(
             (Task.title.ilike(search)) | (Task.description.ilike(search))
         )
-    return (
+
+    # Sorting: due soonest first, then nulls last
+    tasks_db = (
         tasks_query
         .order_by(Task.due_date.isnot(None), Task.due_date.asc())
         .all()
     )
+
+    today = date.today()
+
+    def is_overdue(task_obj) -> bool:
+        if not task_obj.due_date:
+            return False
+        # task_obj.due_date may be naive, interpret as local or UTC
+        due = task_obj.due_date
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        # Consider overdue if due date is before today and not completed
+        return (due.date() < today) and (not task_obj.completed)
+
+    # Convert to TaskOut + add overdue flag
+    taskouts: List[TaskOut] = []
+    for t in tasks_db:
+        taskout = TaskOut(
+            id=t.id,
+            title=t.title,
+            description=t.description,
+            category=t.category,
+            priority=t.priority,
+            due_date=t.due_date,
+            completed=t.completed,
+            overdue=is_overdue(t),
+        )
+        taskouts.append(taskout)
+
+    # Grouping support
+    if group_by == "category":
+        # Group tasks_out by their category
+        grouped: Dict[Optional[str], List[TaskOut]] = {}
+        for t in taskouts:
+            cat = t.category if t.category is not None else "Uncategorized"
+            if cat not in grouped:
+                grouped[cat] = []
+            grouped[cat].append(t)
+        return [
+            CategoryGroup(category=cat, tasks=ts)
+            for cat, ts in grouped.items()
+        ]
+    else:
+        return taskouts
 
 
 # PUBLIC_INTERFACE
@@ -182,7 +250,26 @@ def create_task(task_in: TaskCreate, db: Session = Depends(get_db)):
     db.add(task_obj)
     db.commit()
     db.refresh(task_obj)
-    return task_obj
+    # Add overdue flag in response
+    overdue = False
+    if task_obj.due_date:
+        task_due = task_obj.due_date
+        if task_due.tzinfo is None:
+            task_due = task_due.replace(tzinfo=timezone.utc)
+        overdue = (
+            (task_due.date() < date.today())
+            and (not task_obj.completed)
+        )
+    return TaskOut(
+        id=task_obj.id,
+        title=task_obj.title,
+        description=task_obj.description,
+        category=task_obj.category,
+        priority=task_obj.priority,
+        due_date=task_obj.due_date,
+        completed=task_obj.completed,
+        overdue=overdue,
+    )
 
 
 # PUBLIC_INTERFACE
@@ -211,7 +298,23 @@ def update_task(
         setattr(task, field, value)
     db.commit()
     db.refresh(task)
-    return task
+    # Compute overdue flag for response
+    overdue = False
+    if task.due_date:
+        task_due = task.due_date
+        if task_due.tzinfo is None:
+            task_due = task_due.replace(tzinfo=timezone.utc)
+        overdue = (task_due.date() < date.today()) and (not task.completed)
+    return TaskOut(
+        id=task.id,
+        title=task.title,
+        description=task.description,
+        category=task.category,
+        priority=task.priority,
+        due_date=task.due_date,
+        completed=task.completed,
+        overdue=overdue
+    )
 
 
 # PUBLIC_INTERFACE
